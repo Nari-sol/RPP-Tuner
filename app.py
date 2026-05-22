@@ -55,6 +55,68 @@ def load_multiple_csvs_basic(uploaded_files):
 
 # --- 関数: CSV/Excel読み込み（新：高機能版） ---
 def load_multiple_csvs_advanced(uploaded_files):
+    import datetime
+    
+    local_discount_map = {}
+    
+    # 1. 割引シートの事前スキャン
+    for uploaded_file in uploaded_files:
+        is_excel = uploaded_file.name.endswith(('.xlsx', '.xls', '.xlsm'))
+        if is_excel:
+            try:
+                xls = pd.read_excel(uploaded_file, sheet_name=None, header=None)
+                for sheet_name, df_raw in xls.items():
+                    if '割引' in str(sheet_name):
+                        for idx, row in df_raw.iterrows():
+                            if len(row) < 2:
+                                continue
+                            val_a = row.iloc[0]
+                            val_b = row.iloc[1]
+                            
+                            if pd.isna(val_a) or pd.isna(val_b):
+                                continue
+                            
+                            month_key = None
+                            if isinstance(val_a, (pd.Timestamp, datetime.date, datetime.datetime)):
+                                month_key = f"{val_a.month}月"
+                            else:
+                                str_a = str(val_a).strip()
+                                if str_a.lower() in ["nan", "none", ""]:
+                                    continue
+                                match = re.search(r'(\d+)', str_a)
+                                if match:
+                                    month_key = match.group(1) + "月"
+                            
+                            if not month_key:
+                                continue
+                            
+                            try:
+                                str_b = str(val_b).replace(',', '').strip()
+                                discount_val = float(str_b)
+                                if discount_val >= 0:
+                                    local_discount_map[month_key] = discount_val
+                            except ValueError:
+                                continue
+            except Exception:
+                pass
+
+    # st.session_state への保存
+    if local_discount_map:
+        if 'discount_map' not in st.session_state:
+            st.session_state['discount_map'] = {}
+        st.session_state['discount_map'].update(local_discount_map)
+        
+    # 割引情報の決定（優先度：1.今回の割引シート, 2.セッションの割引シート）
+    active_discount_map = {}
+    if local_discount_map:
+        active_discount_map = local_discount_map
+    elif 'discount_map' in st.session_state and st.session_state['discount_map']:
+        active_discount_map = st.session_state['discount_map']
+        
+    # どちらにも割引情報がない場合は警告表示
+    if not active_discount_map:
+        st.warning("割引情報のシートが読み込まれていません。割引適用なし（元のコスト）で計算しています。全体ダッシュボードで割引情報を読み込むと自動適用されます。")
+
     combined_df = pd.DataFrame()
     for uploaded_file in uploaded_files:
         success = False
@@ -70,9 +132,12 @@ def load_multiple_csvs_advanced(uploaded_files):
         
         if is_excel:
             try:
-                # Excelの場合は全シートを読み込む
                 xls = pd.read_excel(uploaded_file, sheet_name=None, header=None)
                 for sheet_name, df_raw in xls.items():
+                    # 割引シートはデータとして処理しない
+                    if '割引' in str(sheet_name):
+                        continue
+                        
                     # 各シートに対してヘッダー特定
                     header_row_idx = -1
                     for i, row in df_raw.iterrows():
@@ -111,6 +176,42 @@ def load_multiple_csvs_advanced(uploaded_files):
                                 if alias in df.columns:
                                     df[target] = df[alias]
                                     break
+                        
+                        # 割引適用ロジック
+                        sheet_month_match = re.search(r'(\d+)', str(sheet_name))
+                        sheet_month_key = sheet_month_match.group(1) + "月" if sheet_month_match else sheet_name
+                        
+                        if sheet_month_key in active_discount_map and active_discount_map[sheet_month_key] > 0:
+                            discount_amount = active_discount_map[sheet_month_key]
+                            
+                            # 関連カラムを数値にクレンジング
+                            cost_cols = ['実績額(合計)']
+                            if '実績額(新規720時間)' in df.columns:
+                                cost_cols.append('実績額(新規720時間)')
+                            if '実績額(既存720時間)' in df.columns:
+                                cost_cols.append('実績額(既存720時間)')
+                            
+                            for col in cost_cols:
+                                df[col] = pd.to_numeric(
+                                    df[col].astype(str).str.replace(r'[^\d.]', '', regex=True).str.strip(),
+                                    errors='coerce'
+                                ).fillna(0)
+                            
+                            # 総コストを計算
+                            total_cost = df['実績額(合計)'].sum()
+                            
+                            if total_cost > 0:
+                                # 比率を基に割引金額を按分して引く
+                                ratio_total = df['実績額(合計)'] / total_cost
+                                df['実績額(合計)'] = (df['実績額(合計)'] - ratio_total * discount_amount).clip(lower=0)
+                                
+                                if '実績額(新規720時間)' in df.columns:
+                                    ratio_new = df['実績額(新規720時間)'] / total_cost
+                                    df['実績額(新規720時間)'] = (df['実績額(新規720時間)'] - ratio_new * discount_amount).clip(lower=0)
+                                    
+                                if '実績額(既存720時間)' in df.columns:
+                                    ratio_existing = df['実績額(既存720時間)'] / total_cost
+                                    df['実績額(既存720時間)'] = (df['実績額(既存720時間)'] - ratio_existing * discount_amount).clip(lower=0)
                         
                         if not df.empty:
                             combined_df = pd.concat([combined_df, df], ignore_index=True)
@@ -163,6 +264,41 @@ def load_multiple_csvs_advanced(uploaded_files):
                                 if alias in df.columns:
                                     df[target] = df[alias]
                                     break
+                                    
+                        # 割引適用ロジック (CSV用)
+                        csv_month_key = filename_month if filename_month else None
+                        
+                        if csv_month_key and csv_month_key in active_discount_map and active_discount_map[csv_month_key] > 0:
+                            discount_amount = active_discount_map[csv_month_key]
+                            
+                            # 関連カラムを数値にクレンジング
+                            cost_cols = ['実績額(合計)']
+                            if '実績額(新規720時間)' in df.columns:
+                                cost_cols.append('実績額(新規720時間)')
+                            if '実績額(既存720時間)' in df.columns:
+                                cost_cols.append('実績額(既存720時間)')
+                            
+                            for col in cost_cols:
+                                df[col] = pd.to_numeric(
+                                    df[col].astype(str).str.replace(r'[^\d.]', '', regex=True).str.strip(),
+                                    errors='coerce'
+                                ).fillna(0)
+                            
+                            # 総コストを計算
+                            total_cost = df['実績額(合計)'].sum()
+                            
+                            if total_cost > 0:
+                                # 比率を基に割引金額を按分して引く
+                                ratio_total = df['実績額(合計)'] / total_cost
+                                df['実績額(合計)'] = (df['実績額(合計)'] - ratio_total * discount_amount).clip(lower=0)
+                                
+                                if '実績額(新規720時間)' in df.columns:
+                                    ratio_new = df['実績額(新規720時間)'] / total_cost
+                                    df['実績額(新規720時間)'] = (df['実績額(新規720時間)'] - ratio_new * discount_amount).clip(lower=0)
+                                    
+                                if '実績額(既存720時間)' in df.columns:
+                                    ratio_existing = df['実績額(既存720時間)'] / total_cost
+                                    df['実績額(既存720時間)'] = (df['実績額(既存720時間)'] - ratio_existing * discount_amount).clip(lower=0)
                         
                         if not df.empty:
                             combined_df = pd.concat([combined_df, df], ignore_index=True)
